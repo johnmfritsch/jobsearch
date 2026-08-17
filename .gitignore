@@ -1,0 +1,44 @@
+# ── Per-user configuration — CONTAINS LIVE API KEYS ──
+# Each user's config.json holds their SerpAPI / Adzuna credentials.
+# default_config.json is the empty template and IS committed.
+configs/
+!default_config.json
+
+# ── User data ──
+# Resumes, parsed profiles, saved jobs, and per-user dashboards.
+data/
+profiles/
+resumes/
+*.db
+*.sqlite
+*.sqlite3
+# default_resume.txt is a placeholder template and IS committed.
+
+# ── Secrets ──
+.env
+.env.*
+*.pem
+*.key
+
+# ── Runtime output ──
+logs/
+*.log
+*.pid
+backups/
+TRASH/
+
+# ── Timestamped backups ──
+*.bak
+*.backup_*
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── Tooling / OS cruft ──
+.claude/
+.vscode/
+desktop.ini
+Thumbs.db

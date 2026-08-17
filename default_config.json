@@ -1,0 +1,34 @@
+{
+  "sources": {
+    "adzuna": true,
+    "indeed": true,
+    "serpapi": false
+  },
+  "keywords": [],
+  "____comment_keywords": [],
+  "blocked_words": [],
+  "search_local": true,
+  "search_remote": true,
+  "remote": true,
+  "location": "",
+  "zip_code": "",
+  "radius_miles": 50,
+  "salary_min": 0,
+  "scoring_method": "semantic",
+  "____comment_scoring_method": "hybrid",
+  "boost_terms": [],
+  "boost_weight": 0.15,
+  "match_threshold": 0.18,
+  "serpapi_max_pages": 5,
+  "serpapi_local_max_pages": 1,
+  "adzuna_max_pages": 5,
+  "adzuna_results_per_page": 30,
+  "adzuna_local_max_pages": 2,
+  "indeed_max_pages": 5,
+  "indeed_results_per_page": 30,
+  "indeed_local_max_pages": 2,
+  "credentials": {
+    "serpapi": [],
+    "adzuna": []
+  }
+}
