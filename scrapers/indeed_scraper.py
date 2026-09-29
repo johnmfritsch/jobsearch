@@ -138,7 +138,10 @@ def fetch_jobs_indeed(cfg, query, source_counts, user=None, test_mode=False):
                     "snippet": snippet_el.get_text(' ', strip=True) if snippet_el else "",
                     "description": snippet_el.get_text(' ', strip=True) if snippet_el else "",
                     "location": location_el.get_text(strip=True) if location_el else location,
-                    "source": "Indeed"
+                    "source": "Indeed",
+                    "_search_keywords": list(cfg.get("keywords", [])),
+                    "_search_modes": ["remote" if remote else "local"],
+                    "_sources": ["Indeed"],
                 })
 
             msg = f"Indeed: page {page+1} -> {len(cards)} cards (total {len(jobs)} jobs)"

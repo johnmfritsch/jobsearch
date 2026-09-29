@@ -1,0 +1,2 @@
+# Runtime dependencies added or changed by the current project workflow.
+beautifulsoup4==4.15.0

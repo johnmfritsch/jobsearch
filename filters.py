@@ -1,5 +1,14 @@
 import os
-if "/DEV" in os.path.dirname(os.path.abspath(__file__)) or os.path.dirname(os.path.abspath(__file__)).endswith("/DEV"):
+# Environment: prefer JOBSEARCH_ENV (set by config.py / the Flask app that
+# spawns this as a subprocess); fall back to a path check matching the
+# /volume1/Web/JobSearch[_dev] layout for standalone invocation. The old
+# "/DEV" substring check predates the re-platform and no longer matches
+# any real path.
+if os.environ.get("JOBSEARCH_ENV") == "production":
+    environment = "PROD"
+elif os.environ.get("JOBSEARCH_ENV") == "development":
+    environment = "DEV"
+elif any(p.endswith("_dev") for p in os.path.abspath(__file__).split(os.sep)):
     environment = "DEV"
 else:
     environment = "PROD"
@@ -92,9 +101,11 @@ def _is_job_board(url):
     return parent in _JOB_BOARD_DOMAINS
 
 
-import os as _os
-PLAYWRIGHT_SERVICE_URL = "http://127.0.0.1:" + ("3001" if "/DEV" in _os.path.abspath(__file__) else "3000")
-del _os
+# Reuse the `environment` resolved at import time rather than re-deriving it
+# from __file__ — the old "/DEV" substring check silently selected the PROD
+# container (3000) from the dev app, since /volume1/Web/JobSearch_dev has no
+# "/DEV" path segment.
+PLAYWRIGHT_SERVICE_URL = "http://127.0.0.1:" + ("3001" if environment == "DEV" else "3000")
 
 
 def _playwright_available():
@@ -741,64 +752,111 @@ def _extract_location_from_page_text(text):
     return None
 
 
-def passes_simple_filters(job, cfg):
-    """
-    Keyword, salary, and location/remote filters.
-    Sets job['remote_status'] for downstream display:
-      'remote' -> checkmark, 'hybrid' -> H, 'unclear' -> ?, 'onsite' -> blank.
-    """
+def _record_check(audit, key, label, status, evidence, **details):
+    check = {"key": key, "label": label, "status": status, "evidence": evidence}
+    check.update({k: v for k, v in details.items() if v is not None})
+    audit["checks"].append(check)
 
+
+def evaluate_simple_filters(job, cfg):
+    """Apply basic filters and attach an exact, reportable decision trail."""
     title = job.get("title", "").lower()
     snippet = job.get("snippet", "").lower()
     description = job.get("description", "").lower()
     text = " ".join([title, snippet, description])
     job_name = job.get("title", "N/A")
+    configured_keywords = [str(k) for k in cfg.get("keywords", []) if str(k).strip()]
+    blocked_words = [str(b) for b in cfg.get("blocked_words", []) if str(b).strip()]
+    matched_keywords = [k for k in configured_keywords if k.lower() in text]
+    matched_blocked = [b for b in blocked_words if b.lower() in title]
+    audit = {
+        "checks": [],
+        "search_keywords": list(dict.fromkeys(job.get("_search_keywords", []))),
+        "search_modes": list(dict.fromkeys(job.get("_search_modes", []))),
+        "sources": list(dict.fromkeys(job.get("_sources", [job.get("source", "Unknown")]))),
+        "target_employers": list(dict.fromkeys(job.get("_target_employers", []))),
+        "matched_keywords": matched_keywords,
+        "stage_reached": "basic_filters",
+        "outcome": "unknown",
+    }
+    job["_decision"] = audit
 
-    keywords = [k.lower() for k in cfg.get("keywords", [])]
-    blocked = [b.lower() for b in cfg.get("blocked_words", [])]
+    if matched_blocked:
+        _record_check(audit, "blocked_words", "Blocked title words", "fail",
+                      "Title contains: " + ", ".join(matched_blocked),
+                      matched=matched_blocked)
+        audit["outcome"] = "blocked_word"
+        print(f"DEBUG: X '{job_name}' filtered - title contains blocked term '{matched_blocked[0]}'")
+        return False, audit
+    _record_check(audit, "blocked_words", "Blocked title words", "pass",
+                  "No blocked title words found")
+
+    if configured_keywords and not matched_keywords:
+        _record_check(audit, "keywords", "Active keywords", "fail",
+                      "None of the active keywords appeared in the captured posting text")
+        audit["outcome"] = "keyword"
+        print(f"DEBUG: X '{job_name}' filtered - missing required keywords")
+        return False, audit
+    _record_check(audit, "keywords", "Active keywords", "pass",
+                  "Matched: " + ", ".join(matched_keywords) if matched_keywords
+                  else "No active keyword requirement", matched=matched_keywords)
+
     salary_min = cfg.get("salary_min", 0)
+    salary = job.get("salary")
+    if isinstance(salary, (int, float)):
+        if salary < salary_min:
+            _record_check(audit, "salary_min", "Minimum salary", "fail",
+                          f"Listed salary {salary:,.0f} is below {salary_min:,.0f}",
+                          value=salary, threshold=salary_min)
+            audit["outcome"] = "salary"
+            print(f"DEBUG: X '{job_name}' filtered - salary {salary} < {salary_min}")
+            return False, audit
+        _record_check(audit, "salary_min", "Minimum salary", "pass",
+                      f"Listed salary {salary:,.0f} meets {salary_min:,.0f}",
+                      value=salary, threshold=salary_min)
+    else:
+        _record_check(audit, "salary_min", "Minimum salary", "not_applicable",
+                      "No numeric salary was published, so the job remains eligible",
+                      threshold=salary_min)
+
     radius = float(cfg.get("radius_miles", 50))
     zip_code = cfg.get("zip_code", "18080")
-
     center_lat, center_lon = _resolve_zip_coords(zip_code)
-
-    for bad in blocked:
-        if bad in title:
-            print(f"DEBUG: X '{job_name}' filtered - title contains blocked term '{bad}'")
-            return False
-
-    if keywords and not any(k in text for k in keywords):
-        print(f"DEBUG: X '{job_name}' filtered - missing required keywords")
-        return False
-
-    try:
-        salary = job.get("salary")
-        if isinstance(salary, (int, float)) and salary < salary_min:
-            print(f"DEBUG: X '{job_name}' filtered - salary {salary} < {salary_min}")
-            return False
-    except Exception as e:
-        print(f"DEBUG: W Salary parse error for '{job_name}': {e}")
-
     job["remote_status"] = _classify_remote_status(job)
-
     if job["remote_status"] == "remote":
-        return True
+        _record_check(audit, "location", "Work style and location", "pass",
+                      "Classified remote; distance limit does not apply",
+                      value="remote", threshold=radius)
+        audit["stage_reached"] = "enrichment"
+        audit["outcome"] = "passed_basic_filters"
+        return True, audit
 
     lat = job.get("latitude")
     lon = job.get("longitude")
-
     if lat is not None and lon is not None:
         try:
             distance = _distance_miles(center_lat, center_lon, float(lat), float(lon))
+            job["distance_miles"] = round(distance, 1)
             if distance <= radius:
+                _record_check(audit, "location", "Work style and location", "pass",
+                              f"{distance:.1f} miles from the search ZIP, within {radius:g}",
+                              value=round(distance, 1), threshold=radius)
+                audit["stage_reached"] = "enrichment"
+                audit["outcome"] = "passed_basic_filters"
                 print(f"DEBUG: OK '{job_name}' passes - {distance:.1f}mi within {radius}mi radius")
-                return True
-            else:
-                print(f"DEBUG: X '{job_name}' filtered - {distance:.1f}mi outside {radius}mi radius")
-                return False
-        except Exception as e:
-            print(f"DEBUG: W '{job_name}' invalid coordinates - rejecting ({e})")
-            return False
+                return True, audit
+            _record_check(audit, "location", "Work style and location", "fail",
+                          f"{distance:.1f} miles from the search ZIP, outside {radius:g}",
+                          value=round(distance, 1), threshold=radius)
+            audit["outcome"] = "location"
+            print(f"DEBUG: X '{job_name}' filtered - {distance:.1f}mi outside {radius}mi radius")
+            return False, audit
+        except Exception as exc:
+            _record_check(audit, "location", "Work style and location", "fail",
+                          f"Coordinates could not be evaluated: {exc}")
+            audit["outcome"] = "location"
+            print(f"DEBUG: W '{job_name}' invalid coordinates - rejecting ({exc})")
+            return False, audit
 
     normalized_loc = job.get("location", "").lower().replace(',', ' ').replace('.', ' ')
     states = {
@@ -806,12 +864,26 @@ def passes_simple_filters(job, cfg):
         "la","me","md","ma","mi","mn","ms","mo","mt","ne","nv","nh","nj","nm","ny","nc","nd",
         "oh","ok","or","ri","sc","sd","tn","tx","ut","vt","va","wa","wv","wi","wy"
     }
-    for s in states:
-        if re.search(rf"\b{s}\b", normalized_loc) and s != "pa":
+    for state in states:
+        if re.search(rf"\b{state}\b", normalized_loc) and state != "pa":
             job["remote_status"] = "unclear"
-            print(f"DEBUG: X '{job_name}' filtered - state '{s.upper()}' not PA (no coords)")
-            return False
+            _record_check(audit, "location", "Work style and location", "fail",
+                          f"Posting names {state.upper()} and has no usable coordinates",
+                          value=state.upper(), threshold=radius)
+            audit["outcome"] = "location"
+            print(f"DEBUG: X '{job_name}' filtered - state '{state.upper()}' not PA (no coords)")
+            return False, audit
 
     job["remote_status"] = job.get("remote_status", "unclear")
+    _record_check(audit, "location", "Work style and location", "fail",
+                  "Location was ambiguous and had no usable coordinates",
+                  value=job.get("location", ""), threshold=radius)
+    audit["outcome"] = "location"
     print(f"DEBUG: W '{job_name}' unclear location - marking as ambiguous")
-    return False
+    return False, audit
+
+
+def passes_simple_filters(job, cfg):
+    """Compatibility wrapper for callers that only need the boolean result."""
+    passed, _ = evaluate_simple_filters(job, cfg)
+    return passed

@@ -1,0 +1,15 @@
+{
+  "_fixture_note": "Minimized from https://careers.pplweb.com/api/jobs?page=1&keywords=engineer on 2026-09-11.",
+  "totalCount": 54,
+  "count": 1,
+  "jobs": [{"data": {
+    "slug": "15121", "req_id": "15121", "language": "en-us",
+    "title": "Engineer I, II, III or Principal - Project Engineering",
+    "description": "<p>Short listing summary; detail supplies the complete responsibilities and qualifications.</p>",
+    "location_name": "Broadway Office Complex-Annex", "country": "United States",
+    "posted_date": "2026-08-26T14:41:00-04:00", "employment_type": "FULL_TIME",
+    "hiring_organization": "PPL Corporation",
+    "apply_url": "https://careers-pplweb.icims.com/jobs/15121/login",
+    "meta_data": {"canonical_url": "https://careers.pplweb.com/jobs/15121?lang=en-us", "icims": {"date_updated": "2026-09-10T00:00:00Z"}}
+  }}]
+}

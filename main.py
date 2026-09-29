@@ -8,10 +8,12 @@ sys.path.insert(0, SCRAPERS_DIR)
 import time
 from collections import Counter
 from matcher import score_jobs as score_jobs_against_resume
-from filters import passes_simple_filters
+from filters import evaluate_simple_filters
 from resume_parser import load_resume_text
 from profile_store import load_config as load_profile_config, load_resume
-from profile_store import write_run_status, save_run_results
+from profile_store import (write_run_status, save_run_results, save_run_audit,
+                           load_ignored_job_keys, stable_job_key,
+                           active_employer_sources, record_employer_source_status)
 from html_output import write_results_html
 from deduplicate_jobs import deduplicate_jobs
 
@@ -71,6 +73,33 @@ def load_config(config_path):
         return json.load(f)
 
 
+def _pipeline_check(job, key, label, status, evidence, **details):
+    audit = job.setdefault("_decision", {"checks": [], "outcome": "unknown"})
+    check = {"key": key, "label": label, "status": status, "evidence": evidence}
+    check.update({k: v for k, v in details.items() if v is not None})
+    audit.setdefault("checks", []).append(check)
+
+
+def _job_identities(job):
+    """Every identity string this job could be keyed by.
+
+    save_run_results() and save_run_audit() both key a job as
+    `id or url or "title|company"` -- first non-empty wins. Which field wins
+    depends on the source, and the same posting reaches us from several: a run
+    that returns it with an `id` keys it differently from a run that returns
+    only a URL, and differently again from a job the user added by hand from
+    the posting URL. Testing only the winning identity against the ignore list
+    therefore let dismissed jobs reappear whenever the winner changed between
+    runs. Test all three instead -- a match on any one is a match.
+    """
+    identities = []
+    for value in (job.get("id"), job.get("url"),
+                  f"{job.get('title', '')}|{job.get('company', '')}"):
+        if value and value != "|":
+            identities.append(str(value))
+    return identities
+
+
 def enrich_jobs_with_full_pages(prefiltered, user, test_mode, cfg):
     """Returns count of jobs removed by location re-check."""
     """
@@ -97,10 +126,20 @@ def enrich_jobs_with_full_pages(prefiltered, user, test_mode, cfg):
         url = job.get("url", "")
         if not url:
             job["full_fetch"] = "no_url"
+            _pipeline_check(job, "page_location", "Enriched page location",
+                            "not_evaluated", "No posting URL was available")
             skipped += 1
             continue
 
-        full_text = _fetch_full_description(job)
+        # Direct priority-employer adapters already fetched the canonical job
+        # page under the DNS-pinned JobSearch user agent. Reuse that text for
+        # the existing classification/location re-check rather than fetching
+        # the page a second time through the generic provider extractor.
+        full_text = job.get("full_description")
+        if full_text:
+            job["full_fetch"] = "source_provided"
+        else:
+            full_text = _fetch_full_description(job)
         if full_text:
             job["full_description"] = full_text
             # Re-classify with enriched data
@@ -138,20 +177,48 @@ def enrich_jobs_with_full_pages(prefiltered, user, test_mode, cfg):
                         job["location_override"] = "page"
 
                         if page_dist > radius:
+                            _pipeline_check(
+                                job, "page_location", "Enriched page location", "fail",
+                                f"Posting page location {loc_label} is {page_dist:.1f} miles away, outside {radius:g}",
+                                value=round(page_dist, 1), threshold=radius)
                             print(
                                 f"DEBUG: [LOC-REFILTER] '{job.get('title','N/A')}' "
                                 f"page location '{loc_label}' is {page_dist:.1f}mi "
                                 f"(radius={radius}mi) — REMOVING"
                             )
                             job["_remove"] = True
+                            job["_decision"]["outcome"] = "page_location"
+                            job["_decision"]["stage_reached"] = "enrichment"
                             removed_by_loc += 1
                         else:
+                            _pipeline_check(
+                                job, "page_location", "Enriched page location", "pass",
+                                f"Posting page location {loc_label} is {page_dist:.1f} miles away, within {radius:g}",
+                                value=round(page_dist, 1), threshold=radius)
                             print(
                                 f"DEBUG: [LOC-OK] '{job.get('title','N/A')}' "
                                 f"page location '{loc_label}' is {page_dist:.1f}mi — OK"
                             )
+                    else:
+                        _pipeline_check(job, "page_location", "Enriched page location",
+                                        "not_evaluated",
+                                        "A page location was found but could not be geocoded")
+                else:
+                    _pipeline_check(job, "page_location", "Enriched page location",
+                                    "not_evaluated",
+                                    "No reliable location was found in the full posting page")
+            else:
+                _pipeline_check(job, "page_location", "Enriched page location",
+                                "not_applicable",
+                                "Full posting remained classified as remote")
         else:
+            _pipeline_check(job, "page_location", "Enriched page location",
+                            "not_evaluated", "The full posting page could not be fetched")
             failed += 1
+
+        if not job.get("_remove"):
+            job["_decision"]["stage_reached"] = "scoring"
+            job["_decision"]["outcome"] = "passed_enrichment"
 
         # Be polite between fetches
         time.sleep(0.5)
@@ -198,28 +265,45 @@ def main():
     # directory remains only for run status and DEV test fixtures during this
     # migration stage.
     try:
-        cfg = load_profile_config(user, test_mode)
+        cfg = load_profile_config(user, test_mode) or {}
+        if test_mode:
+            active_cfg = load_profile_config(user, False) or {}
+            for field in ("active_search_preset_name", "active_search_preset_id",
+                          "active_search_preset_color"):
+                if active_cfg.get(field) is not None:
+                    cfg[field] = active_cfg[field]
         resume_text = load_resume(user)
     except ValueError as exc:
         print(f"Profile data unavailable for {user}: {exc}")
         sys.exit(1)
 
-    # --- Detect environment from directory path ---
-    if "/DEV" in base_dir or base_dir.endswith("/DEV"):
+    # --- Detect environment ---
+    # Prefer JOBSEARCH_ENV (set by config.py / the Flask app that spawns this
+    # as a subprocess); fall back to the /volume1/Web/JobSearch[_dev] dirname
+    # for standalone invocation. The old "/DEV" substring check predates the
+    # re-platform and no longer matches any real path.
+    if os.environ.get("JOBSEARCH_ENV") == "production":
+        environment = "PROD"
+    elif os.environ.get("JOBSEARCH_ENV") == "development":
+        environment = "DEV"
+    elif os.path.basename(base_dir).endswith("_dev"):
         environment = "DEV"
     else:
         environment = "PROD"
     os.environ["JOB_SEARCH_ENV"] = environment
     print(f"Environment detected: {environment}")
 
-    # --- Output directory based on environment ---
-    if environment == "DEV":
-        web_base = "/volume1/Web/johnmfritsch/JobSearch/DEV"
-        print(f"DEV MODE: Output to {web_base}")
-    else:
-        web_base = "/volume1/Web/johnmfritsch/JobSearch"
+    # --- Output directory ---
+    # SQLite (save_run_results) is canonical; this static HTML is the legacy
+    # dual-write, kept only until Flask templates replace html_output.py.
+    # It deliberately writes INSIDE the app now: the old destination was
+    # /volume1/Web/johnmfritsch/JobSearch/<user>/index.html, which is the LIVE
+    # production page tree — running this from the new app would have
+    # overwritten real users' result pages.
+    web_base = os.path.join(base_dir, "legacy_output")
     output_dir = os.path.join(web_base, user)
     os.makedirs(output_dir, exist_ok=True)
+    print(f"{environment}: legacy HTML output to {output_dir}")
 
     # --- set test/normal output path ---
     output_html = os.path.join(output_dir, "index_test.html" if test_mode else "index.html")
@@ -257,9 +341,9 @@ def main():
             # deterministic no-credit sample so their real filters and resume
             # matching can be exercised without network/API calls.
             jobs = [
-                {"title": "Sample Remote Software Engineer", "company": "JobSearch Demo", "location": "Remote, United States", "remote_status": "remote", "description": "Python automation cloud infrastructure API development", "source": "Built-in test", "url": ""},
-                {"title": "Sample Data Analyst", "company": "JobSearch Demo", "location": "Remote, United States", "remote_status": "remote", "description": "SQL reporting analytics dashboards stakeholder communication", "source": "Built-in test", "url": ""},
-                {"title": "Sample Operations Coordinator", "company": "JobSearch Demo", "location": "Allentown, PA", "remote_status": "local", "description": "Operations process improvement project coordination", "source": "Built-in test", "url": ""},
+                {"title": "Sample Remote Software Engineer", "company": "JobSearch Demo", "location": "Remote, United States", "remote_status": "remote", "description": "Python automation cloud infrastructure API development", "source": "Built-in test", "url": "", "_search_keywords": [], "_search_modes": ["test"], "_sources": ["Built-in test"]},
+                {"title": "Sample Data Analyst", "company": "JobSearch Demo", "location": "Remote, United States", "remote_status": "remote", "description": "SQL reporting analytics dashboards stakeholder communication", "source": "Built-in test", "url": "", "_search_keywords": [], "_search_modes": ["test"], "_sources": ["Built-in test"]},
+                {"title": "Sample Operations Coordinator", "company": "JobSearch Demo", "location": "Allentown, PA", "remote_status": "local", "description": "Operations process improvement project coordination", "source": "Built-in test", "url": "", "_search_keywords": [], "_search_modes": ["test"], "_sources": ["Built-in test"]},
             ]
             print(f"No legacy fixture for {user}; using {len(jobs)} built-in no-credit test jobs")
         else:
@@ -318,6 +402,27 @@ def main():
                 except Exception as e:
                     print(f"DEBUG: {source_name} remote fetch failed: {e}")
 
+        # Priority employers use a per-record dispatcher rather than the
+        # fixed provider tuple above. They intentionally run after the normal
+        # provider passes and before the common deduplication/filter pipeline.
+        from employer_source_scraper import fetch_employer_jobs
+        for employer in active_employer_sources(user, cfg):
+            label = employer.get("company_name", "Priority employer")
+            write_status(user, test_mode, "running", f"Checking priority employer: {label}...")
+            try:
+                employer_jobs = fetch_employer_jobs(
+                    employer, cfg, source_counts, user=user, test_mode=test_mode)
+                jobs += employer_jobs
+                record_employer_source_status(user, employer["id"], True)
+                write_status(user, test_mode, "running",
+                             f"Priority employer {label}: {len(employer_jobs)} job(s) found")
+            except Exception as e:
+                message = str(e)[:500] or "Could not check this priority employer"
+                print(f"DEBUG: priority employer {label} fetch failed: {message}")
+                record_employer_source_status(user, employer["id"], False, message)
+                write_status(user, test_mode, "running",
+                             f"Priority employer warning for {label}: {message}")
+
     fetched_total = len(jobs)
     print(f"Fetched {fetched_total} jobs{' (test data)' if test_mode else ''}")
     write_status(user, test_mode, "running", f"Fetched {fetched_total} jobs, processing...")
@@ -327,12 +432,42 @@ def main():
         jobs = deduplicate_jobs(jobs)
         write_status(user, test_mode, "running", "Removing duplicate jobs...")
     after_dedup = len(jobs)
+    audited_jobs = list(jobs)
+
+    # The ignore list holds jobs the user dismissed AND jobs the user added to
+    # the tracker by hand -- both are already decided, so re-presenting them as
+    # fresh matches is noise. Keep them in the decision audit, but do not
+    # enrich, score, or publish them.
+    ignored_keys = load_ignored_job_keys(user)
+    searchable_jobs = []
+    ignored_count = 0
+    for job in jobs:
+        if any(stable_job_key(identity) in ignored_keys
+               for identity in _job_identities(job)):
+            _pipeline_check(
+                job, "ignore_list", "Ignore list", "fail",
+                "Already decided: dismissed or added to the tracker by hand")
+            decision = job.setdefault("_decision", {"checks": []})
+            decision["stage_reached"] = "ignore_list"
+            decision["outcome"] = "ignore_list"
+            ignored_count += 1
+        else:
+            _pipeline_check(
+                job, "ignore_list", "Ignore list", "pass",
+                "Job is not on the ignore list")
+            searchable_jobs.append(job)
+    jobs = searchable_jobs
+    after_ignore_list = len(jobs)
+    if ignored_count:
+        write_status(user, test_mode, "running",
+                     f"Ignored {ignored_count} previously dismissed job(s)")
 
     # Filter jobs with progress updates
     write_status(user, test_mode, "running", f"Filtering {len(jobs)} jobs...")
     prefiltered = []
     for idx, j in enumerate(jobs):
-        if passes_simple_filters(j, cfg):
+        passed, _ = evaluate_simple_filters(j, cfg)
+        if passed:
             prefiltered.append(j)
         # Update status every 100 jobs
         if (idx + 1) % 100 == 0:
@@ -341,25 +476,28 @@ def main():
     print(f"{after_keyword_filter} jobs passed keyword filters")
     write_status(user, test_mode, "running", f"{after_keyword_filter} jobs passed keyword filters")
 
-    if not prefiltered and jobs:
-        print("No jobs passed filters -- scoring all results instead.")
-        prefiltered = jobs
-
     if not prefiltered:
         print("No jobs matched criteria. Generating empty results page.")
-        write_status(user, test_mode, "complete", "No jobs found matching criteria")
+        write_status(user, test_mode, "running", "No jobs matched criteria; preparing the empty result and decision report")
         # Generate empty results page
         runtime = time.time() - start_time
         write_status(user, test_mode, "running", "Generating HTML report...")
         pipeline_stats = {
             "fetched_total": fetched_total,
             "after_dedup": after_dedup,
+            "after_ignore_list": after_ignore_list,
+            "ignored_count": ignored_count,
             "after_keyword_filter": 0,
             "after_loc_recheck": 0,
             "after_scoring": 0,
             "source_fetched": dict(source_counts),
+            "outcomes": dict(Counter(
+                j.get("_decision", {}).get("outcome", "unknown")
+                for j in audited_jobs)),
         }
         write_results_html([], output_html, cfg, user=user, runtime_seconds=runtime, source_counts={}, pipeline_stats=pipeline_stats, test_mode=test_mode)
+        run_id = save_run_results(user, test_mode, [], cfg)
+        save_run_audit(user, run_id, cfg, audited_jobs, pipeline_stats)
         write_status(user, test_mode, "complete", "No jobs found matching criteria")
         print(f"Complete -- 0 matches written to {output_html}")
         return
@@ -371,6 +509,23 @@ def main():
     scored = score_jobs_against_resume(cfg, prefiltered, resume_text, user=user, test_mode=test_mode)
     write_status(user, test_mode, "running", f"Scoring {len(prefiltered)} jobs against resume...")
     matches = [s for s in scored if s["score"] >= match_threshold]
+
+    for job in scored:
+        audit = job.setdefault("_decision", {"checks": []})
+        score = job.get("score", 0.0)
+        details = job.get("match_details", {})
+        passed = score >= match_threshold
+        _pipeline_check(
+            job, "resume_score", "Resume match threshold",
+            "pass" if passed else "fail",
+            f"Final score {score:.3f} {'meets' if passed else 'is below'} {match_threshold:.3f}",
+            value=score, threshold=match_threshold,
+            resume_similarity=details.get("resume_similarity"),
+            boost_points=details.get("boost_points"))
+        audit["stage_reached"] = "complete"
+        audit["matched_keywords"] = job.get("matches", {}).get("keywords", [])
+        audit["matched_boost_terms"] = job.get("matches", {}).get("boost_terms", [])
+        audit["outcome"] = "included" if passed else "resume_score"
 
     # Log per-job scores so the user can see what passed/failed the threshold
     scored_sorted = sorted(scored, key=lambda s: s["score"], reverse=True)
@@ -392,15 +547,21 @@ def main():
     pipeline_stats = {
         "fetched_total": fetched_total,
         "after_dedup": after_dedup,
+        "after_ignore_list": after_ignore_list,
+        "ignored_count": ignored_count,
         "after_keyword_filter": after_keyword_filter,
         "after_loc_recheck": after_loc_recheck,
         "after_scoring": len(matches),
         "source_fetched": dict(source_counts),
+        "outcomes": dict(Counter(
+            j.get("_decision", {}).get("outcome", "unknown")
+            for j in audited_jobs)),
     }
 
     write_status(user, test_mode, "running", "Generating HTML report...")
     write_results_html(matches, output_html, cfg, user=user, runtime_seconds=runtime, source_counts=total_counts, pipeline_stats=pipeline_stats, test_mode=test_mode)
-    save_run_results(user, test_mode, matches)
+    run_id = save_run_results(user, test_mode, matches, cfg)
+    save_run_audit(user, run_id, cfg, audited_jobs, pipeline_stats)
     print(f"Complete -- {len(matches)} matches written to {output_html}")
     write_status(user, test_mode, "complete", f"Job search complete! Found {len(matches)} matches.")
 

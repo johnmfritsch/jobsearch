@@ -1,5 +1,14 @@
 import os
-if "/DEV" in os.path.dirname(os.path.abspath(__file__)) or os.path.dirname(os.path.abspath(__file__)).endswith("/DEV"):
+# Environment: prefer JOBSEARCH_ENV (set by config.py / the Flask app that
+# spawns this as a subprocess); fall back to a path check matching the
+# /volume1/Web/JobSearch[_dev] layout for standalone invocation. The old
+# "/DEV" substring check predates the re-platform and no longer matches
+# any real path.
+if os.environ.get("JOBSEARCH_ENV") == "production":
+    environment = "PROD"
+elif os.environ.get("JOBSEARCH_ENV") == "development":
+    environment = "DEV"
+elif any(p.endswith("_dev") for p in os.path.abspath(__file__).split(os.sep)):
     environment = "DEV"
 else:
     environment = "PROD"
@@ -124,6 +133,9 @@ def fetch_jobs_serpapi(cfg, base_query, source_counts, user=None, test_mode=Fals
                         "latitude": item.get("latitude"),
                         "longitude": item.get("longitude"),
                         "source": "SerpAPI",
+                        "_search_keywords": [kw],
+                        "_search_modes": ["remote" if remote else "local"],
+                        "_sources": ["SerpAPI"],
                     })
 
                 time.sleep(1.2)

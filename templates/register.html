@@ -1,0 +1,22 @@
+{% extends "auth_base.html" %}
+{% block title %}Create account — JobSearch{% endblock %}
+{% block subtitle %}Create a new account{% endblock %}
+{% block content %}
+<form method="post" autocomplete="on">
+  <label for="display_name">Display name</label>
+  <input id="display_name" name="display_name" value="{{ display_name }}" required autofocus>
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" value="{{ email }}" required
+         autocomplete="username">
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" required minlength="8"
+         autocomplete="new-password">
+  <label for="password_confirmation">Confirm password</label>
+  <input id="password_confirmation" name="password_confirmation" type="password" required
+         minlength="8" autocomplete="new-password">
+  <button type="submit">Create account</button>
+</form>
+<div class="links">
+  <a href="{{ url_for('auth.login') }}">Back to sign in</a>
+</div>
+{% endblock %}

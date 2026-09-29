@@ -1,0 +1,12 @@
+{
+  "_fixture_note": "Minimized from https://jobs.booking.com/api/jobs/29701/en-us on 2026-09-11.",
+  "slug": "29701", "req_id": "29701", "language": "en-us",
+  "title": "Enterprise Applications Engineer II",
+  "description": "<h2>About us</h2><p>Data drives decisions and technology is at our core.</p>",
+  "qualifications": "<ul><li>Software development experience</li><li>Clear communication</li></ul>",
+  "responsibilities": "<ul><li>Maintain enterprise applications</li><li>Collaborate with stakeholders</li></ul>",
+  "location_name": "Amsterdam Campus", "employment_type": "PART_TIME",
+  "posted_date": "2026-07-10T08:18:00-04:00", "hiring_organization": "Booking.com",
+  "apply_url": "https://external-workingatbooking.icims.com/jobs/29701/login",
+  "meta_data": {"canonical_url": "https://jobs.booking.com/booking/jobs/29701?lang=en-us"}
+}

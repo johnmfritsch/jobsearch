@@ -1,35 +1,41 @@
-# ── Per-user configuration — CONTAINS LIVE API KEYS ──
-# Each user's config.json holds their SerpAPI / Adzuna credentials.
-# default_config.json is the empty template and IS committed.
-configs/
-!default_config.json
-
-# ── User data ──
-# Resumes, parsed profiles, saved jobs, and per-user dashboards.
-data/
-profiles/
-resumes/
-*.db
-*.sqlite
-*.sqlite3
-# default_resume.txt is a placeholder template and IS committed.
-
 # ── Secrets ──
+# Flask session signing key; provider credentials live in the database, not files.
+secret_key.txt
+secrets/
 .env
 .env.*
 *.pem
 *.key
 
-# ── Runtime output ──
+# ── Databases and user data ──
+# Accounts, résumés, cover letters, search results, application history.
+data/
+*.db
+*.db.*
+*.sqlite
+*.sqlite3
+
+# ── Legacy per-user dashboards (other people's search results) ──
+legacy_output/
+configs/
+
+# ── Runtime state and output ──
 logs/
 *.log
 *.pid
+gunicorn.ctl
 backups/
-TRASH/
 
 # ── Timestamped backups ──
 *.bak
 *.backup_*
+*_backup_*
+
+# ── Planning / working notes (not documentation) ──
+HANDOFF.md
+AGENTS.md
+CLAUDE.md
+*_PLAN*.md
 
 # ── Python ──
 __pycache__/

@@ -1,71 +1,64 @@
-"""DEV SQLite foundation for the JobSearch account migration."""
+"""SQLite access for JobSearch.
+
+Two accessors, deliberately kept separate:
+
+* get_db()      — a NEW connection the caller must close. This is what the
+                  pipeline uses: main.py runs as a detached subprocess with no
+                  Flask context at all, and profile_store.py closes after every
+                  operation.
+* request_db()  — the connection for the current Flask request, cached on `g`
+                  and closed by app.py's teardown handler.
+
+Keeping them apart avoids a real footgun: profile_store's `finally: db.close()`
+would close a request-scoped connection out from under the rest of the request
+if both shared one accessor.
+
+Two deliberate differences from the pre-re-platform database.py:
+
+1. The path comes from config.py, so it follows JOBSEARCH_ENV
+   (data/jobsearch_dev.db vs data/jobsearch.db). The old module hardcoded
+   'jobsearch_dev.db' in every environment, which would have pointed
+   production at a file that does not exist.
+2. It does NOT create or patch schema. migrations/ owns the schema; a module
+   that silently CREATE TABLEs behind the migration runner's back makes
+   schema_diff.py and `migrate.py status` untrustworthy.
+"""
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).with_name("data") / "jobsearch_dev.db"
+from config import Config
 
-SCHEMA = """
-PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
-  display_name TEXT NOT NULL, profile_key TEXT UNIQUE, legacy_directory TEXT UNIQUE,
-  is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS user_profiles (
-  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  config_json TEXT NOT NULL DEFAULT '{}', test_config_json TEXT NOT NULL DEFAULT '{}',
-  config_prev_json TEXT, test_config_prev_json TEXT,
-  resume_text TEXT NOT NULL DEFAULT '', onboarding_state TEXT NOT NULL DEFAULT 'complete',
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS application_records (
-  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  job_key TEXT NOT NULL, record_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE(user_id, job_key)
-);
-CREATE TABLE IF NOT EXISTS saved_views (
-  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name TEXT NOT NULL, filters_json TEXT NOT NULL, UNIQUE(user_id, name)
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS search_runs (
-  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  test_mode INTEGER NOT NULL, state TEXT NOT NULL, status_json TEXT NOT NULL,
-  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT
-);
-CREATE TABLE IF NOT EXISTS job_results (
-  id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES search_runs(id) ON DELETE CASCADE,
-  job_key TEXT NOT NULL, job_json TEXT NOT NULL, score REAL, UNIQUE(run_id, job_key)
-);
-CREATE TABLE IF NOT EXISTS imported_profile_claims (
-  legacy_directory TEXT PRIMARY KEY, code_hash TEXT NOT NULL,
-  expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-"""
 
-def get_db(path=DB_PATH):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path)
+def db_path():
+    return Path(Config.get_config().DATABASE)
+
+
+def _connect(path=None):
+    target = Path(path) if path else db_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(target)
     db.row_factory = sqlite3.Row
-    db.executescript(SCHEMA)
-    # Existing DEV databases predate legacy_directory.  Keep this migration
-    # idempotent so opening the database never requires manual intervention.
-    columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
-    if "legacy_directory" not in columns:
-        db.execute("ALTER TABLE users ADD COLUMN legacy_directory TEXT")
-        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_legacy_directory_unique ON users(legacy_directory) WHERE legacy_directory IS NOT NULL")
-        db.commit()
-    if "profile_key" not in columns:
-        db.execute("ALTER TABLE users ADD COLUMN profile_key TEXT")
-        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_profile_key_unique ON users(profile_key) WHERE profile_key IS NOT NULL")
-        db.execute("UPDATE users SET profile_key=legacy_directory WHERE profile_key IS NULL AND legacy_directory IS NOT NULL")
-        db.commit()
-    profile_columns = {row["name"] for row in db.execute("PRAGMA table_info(user_profiles)")}
-    for name, definition in (("test_config_json", "TEXT NOT NULL DEFAULT '{}'"), ("config_prev_json", "TEXT"), ("test_config_prev_json", "TEXT"), ("onboarding_state", "TEXT NOT NULL DEFAULT 'complete'")):
-        if name not in profile_columns:
-            db.execute(f"ALTER TABLE user_profiles ADD COLUMN {name} {definition}")
-    db.commit()
+    # SQLite defaults foreign_keys OFF per connection; the migrations declare
+    # ON DELETE CASCADE relationships that silently do nothing without this.
+    db.execute('PRAGMA foreign_keys = ON')
     return db
+
+
+def get_db(path=None):
+    """A fresh connection. The caller owns it and must close it."""
+    return _connect(path)
+
+
+def request_db():
+    """The current request's connection. Closed by app.py's teardown."""
+    from flask import g
+    if 'db' not in g:
+        g.db = _connect()
+    return g.db
+
+
+def close_request_db(exception=None):
+    from flask import g
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()

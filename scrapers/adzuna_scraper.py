@@ -120,6 +120,9 @@ def fetch_jobs_adzuna(cfg, base_query, source_counts, user=None, test_mode=False
                         "latitude": item.get("latitude"),
                         "longitude": item.get("longitude"),
                         "source": "Adzuna",
+                        "_search_keywords": [kw],
+                        "_search_modes": ["remote" if remote else "local"],
+                        "_sources": ["Adzuna"],
                     })
 
                 if not results:

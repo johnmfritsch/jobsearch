@@ -1,0 +1,13 @@
+{
+  "_fixture_note": "Minimized from https://jobs.booking.com/api/jobs?page=1&keywords=engineer on 2026-09-11.",
+  "totalCount": 47,
+  "count": 1,
+  "jobs": [{"data": {
+    "slug": "29701", "req_id": "29701", "language": "en-us",
+    "title": "Enterprise Applications Engineer II", "description": "<p>Booking.com engineering role.</p>",
+    "location_name": "Amsterdam Campus", "country": "Netherlands", "employment_type": "PART_TIME",
+    "posted_date": "2026-07-10T08:18:00-04:00", "hiring_organization": "Booking.com",
+    "apply_url": "https://external-workingatbooking.icims.com/jobs/29701/login",
+    "meta_data": {"canonical_url": "https://jobs.booking.com/booking/jobs/29701?lang=en-us", "icims": {"date_updated": "2026-09-04T00:00:00Z"}}
+  }}]
+}

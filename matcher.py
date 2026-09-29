@@ -1,7 +1,16 @@
 # matcher.py
 
 import os
-if "/DEV" in os.path.dirname(os.path.abspath(__file__)) or os.path.dirname(os.path.abspath(__file__)).endswith("/DEV"):
+# Environment: prefer JOBSEARCH_ENV (set by config.py / the Flask app that
+# spawns this as a subprocess); fall back to a path check matching the
+# /volume1/Web/JobSearch[_dev] layout for standalone invocation. The old
+# "/DEV" substring check predates the re-platform and no longer matches
+# any real path.
+if os.environ.get("JOBSEARCH_ENV") == "production":
+    environment = "PROD"
+elif os.environ.get("JOBSEARCH_ENV") == "development":
+    environment = "DEV"
+elif any(p.endswith("_dev") for p in os.path.abspath(__file__).split(os.sep)):
     environment = "DEV"
 else:
     environment = "PROD"
@@ -147,10 +156,26 @@ def score_jobs(cfg, jobs, resume_text, user=None, test_mode=False):
     boost_weight = cfg.get("boost_weight", 0.05)  # default +0.05 per match
 
     for i, job in enumerate(jobs):
-        desc = (job.get("description", "") + " " + job.get("title", "")).lower()
-        boost_score = sum(1 for term in boost_terms if term in desc)
-        final_score = float(sims[i]) + (boost_score * boost_weight)
+        desc = (job.get("description", "") + " " + job.get("title", "") +
+                " " + job.get("snippet", "")).lower()
+        matched_boosts = [term for term in boost_terms if term in desc]
+        matched_keywords = [term for term in cfg.get("keywords", [])
+                            if str(term).lower() in desc]
+        similarity_score = float(sims[i])
+        boost_points = len(matched_boosts) * boost_weight
+        final_score = similarity_score + boost_points
         job["score"] = round(min(final_score, 1.0), 3)  # cap at 1.0
+        job["matches"] = {
+            "keywords": matched_keywords,
+            "boost_terms": matched_boosts,
+        }
+        job["match_details"] = {
+            "method": method,
+            "resume_similarity": round(similarity_score, 3),
+            "boost_weight": boost_weight,
+            "boost_points": round(boost_points, 3),
+            "final_score": job["score"],
+        }
 
     msg = f"Assigned similarity scores for {len(jobs)} jobs"
     print(f"DEBUG: {msg}")

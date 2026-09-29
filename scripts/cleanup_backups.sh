@@ -1,31 +1,36 @@
 #!/opt/bin/bash
-# Retain the five newest PROD deploy tarballs and 30 days of per-file DEV backups.
+#
+# cleanup_backups.sh — JobSearch backup retention
+#
+# 1. Prod deploy tarballs (prod backups/): keep newest KEEP_TARBALLS
+# 2. Per-file .backup_* copies (dev + prod backups/): delete older than KEEP_FILE_DAYS days
+#
+# Called automatically at the end of deploy_to_prod.sh; safe to run manually:
+#   /opt/bin/bash /volume1/Web/JobSearch_dev/scripts/cleanup_backups.sh
 
-set -euo pipefail
-
-DEV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROD_DIR="$(dirname "$DEV_DIR")/PROD"
-TARBALL_DIR="$PROD_DIR/backups"
+TARBALL_DIR="/volume1/Web/JobSearch/backups"
+FILE_BACKUP_DIRS="/volume1/Web/JobSearch_dev/backups /volume1/Web/JobSearch/backups"
 KEEP_TARBALLS=5
 KEEP_FILE_DAYS=30
 
-echo "Backup cleanup (keep $KEEP_TARBALLS deploy tarballs; $KEEP_FILE_DAYS days of file backups)..."
+echo "Backup cleanup (keep $KEEP_TARBALLS tarballs, $KEEP_FILE_DAYS days of file backups)..."
 
+# --- Prod deploy tarballs: keep newest N ---
 if [ -d "$TARBALL_DIR" ]; then
-    # BusyBox find lacks GNU -printf; ls -t is sufficient for these timestamped files.
-    mapfile -t tarballs < <(ls -1t "$TARBALL_DIR"/PROD_backup_*.tar.gz 2>/dev/null || true)
-    for ((i=KEEP_TARBALLS; i<${#tarballs[@]}; i++)); do
-        rm -f -- "${tarballs[$i]}"
-        echo "  pruned tarball: $(basename "${tarballs[$i]}")"
+    ls -1t "$TARBALL_DIR"/jobsearch_prod_*.tar.gz 2>/dev/null | tail -n +"$((KEEP_TARBALLS + 1))" | while read -r f; do
+        rm -f "$f" && echo "  pruned tarball: $(basename "$f")"
     done
-    echo "  deploy tarballs remaining: $(( ${#tarballs[@]} < KEEP_TARBALLS ? ${#tarballs[@]} : KEEP_TARBALLS ))"
+    COUNT=$(ls -1 "$TARBALL_DIR"/jobsearch_prod_*.tar.gz 2>/dev/null | wc -l)
+    echo "  tarballs remaining: $COUNT"
 fi
 
-for backup_dir in "$DEV_DIR/backups" "$PROD_DIR/backups"; do
-    [ -d "$backup_dir" ] || continue
-    old_count=$(find "$backup_dir" -maxdepth 1 -type f -name '*.backup_*' -mtime "+$KEEP_FILE_DAYS" -print | wc -l)
-    if [ "$old_count" -gt 0 ]; then
-        find "$backup_dir" -maxdepth 1 -type f -name '*.backup_*' -mtime "+$KEEP_FILE_DAYS" -delete
-        echo "  removed $old_count old file backup(s) from $backup_dir"
+# --- Per-file .backup_* copies: delete older than N days ---
+for d in $FILE_BACKUP_DIRS; do
+    [ -d "$d" ] || continue
+    N=$(find "$d" -maxdepth 1 -name "*.backup_*" -mtime +"$KEEP_FILE_DAYS" 2>/dev/null | wc -l)
+    if [ "$N" -gt 0 ]; then
+        find "$d" -maxdepth 1 -name "*.backup_*" -mtime +"$KEEP_FILE_DAYS" -exec rm -f {} \;
+        echo "  deleted $N file backup(s) older than ${KEEP_FILE_DAYS}d in $d"
     fi
 done
+echo "  Backup cleanup done."
