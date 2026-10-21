@@ -158,6 +158,54 @@ def save_pdf(db, database_path, user_id, role, kind, content, original_name,
                            (document_id,)).fetchone())
 
 
+def role_key_name(db, user_id, role_key):
+    """Display name for a stored role key ('default', 'preset:<id>')."""
+    if role_key == 'default':
+        return 'Default'
+    if str(role_key).startswith('preset:'):
+        try:
+            row = db.execute('SELECT name FROM search_presets WHERE id=? AND user_id=?',
+                             (int(str(role_key)[7:]), user_id)).fetchone()
+        except ValueError:
+            row = None
+        if row:
+            return row['name']
+    return str(role_key or '')
+
+
+def current_document(db, user_id, role_key, kind, file_format):
+    """The role's current document summary, or None."""
+    row = _current(db, user_id, role_key, kind, file_format)
+    if not row:
+        return None
+    sha = row['sha256']
+    if not sha and row['content_text']:
+        sha = hashlib.sha256(str(row['content_text']).encode('utf-8')).hexdigest()
+    return {'document_id': row['id'], 'version': row['version'], 'sha256': sha,
+            'file_name': row['file_name'], 'text': row['content_text']}
+
+
+def resume_text_for_role_key(db, user_id, role_key):
+    """Resume text for exactly this role: the current txt document, else that
+    preset's saved resume text. Never the account-level fallback. Returns
+    {'text', 'document_id', 'version', 'sha256'} (ids None for a preset-only
+    resume) or None."""
+    doc = current_document(db, user_id, role_key, 'resume', 'txt')
+    if doc and str(doc['text'] or '').strip():
+        return {'text': doc['text'], 'document_id': doc['document_id'],
+                'version': doc['version'], 'sha256': doc['sha256']}
+    if str(role_key).startswith('preset:'):
+        try:
+            row = db.execute('SELECT resume_text FROM search_presets WHERE id=? AND user_id=?',
+                             (int(str(role_key)[7:]), user_id)).fetchone()
+        except ValueError:
+            row = None
+        if row and str(row['resume_text'] or '').strip():
+            return {'text': row['resume_text'], 'document_id': None,
+                    'version': None, 'sha256': None}
+    return None
+
+
 def list_documents(db, user_id, role):
     rows = db.execute(
         'SELECT id,role_name,kind,format,version,is_current,source,file_name,'

@@ -48,6 +48,12 @@ def create_app():
     application.config['APPLICATION_SUBMIT_ENABLED'] = (
         os.environ.get('JOBSEARCH_APPLICATION_SUBMIT_ENABLED', '').lower() == 'true'
     )
+    # The desktop-agent API (apply queue) is dark until this is exported for the
+    # process that starts the app. Not set in start_jobsearch.py, so a reboot
+    # leaves it off, the same as the two worker flags.
+    application.config['AGENT_API_ENABLED'] = (
+        os.environ.get('JOBSEARCH_AGENT_API_ENABLED', '').lower() == 'true'
+    )
     default_worker_port = '3010' if getattr(config, 'ENV', '') == 'production' else '3011'
     application.config['APPLICATION_WORKER_URL'] = os.environ.get(
         'JOBSEARCH_APPLICATION_WORKER_URL', f'http://127.0.0.1:{default_worker_port}'
@@ -95,10 +101,12 @@ def create_app():
     from auth import auth_bp
     from api import api_bp
     from portal import portal_bp
+    from backlog_admin import backlog_bp
     application.register_blueprint(health_bp)
     application.register_blueprint(auth_bp)
     application.register_blueprint(api_bp)
     application.register_blueprint(portal_bp)
+    application.register_blueprint(backlog_bp)
 
     application.teardown_appcontext(database.close_request_db)
 

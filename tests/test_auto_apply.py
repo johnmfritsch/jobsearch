@@ -64,6 +64,7 @@ class AutoApplyTests(unittest.TestCase):
         load_migration('013').up(self.db)
         load_migration('014').up(self.db)
         load_migration('015').up(self.db)
+        load_migration('023').up(self.db)
 
     def tearDown(self):
         self.db.close()

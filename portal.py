@@ -26,4 +26,5 @@ def dashboard():
     user = current_user()
     return render_template('portal.html',
                            display_name=user['display_name'],
-                           profile_key=user['profile_key'])
+                           profile_key=user['profile_key'],
+                           is_admin=bool(user['is_admin']))

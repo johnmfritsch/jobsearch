@@ -29,6 +29,7 @@ ATTEMPT_STATES = {
     'manual_required': 'Manual application required',
     'unsupported_site': 'Unsupported application site',
     'cancelled': 'Cancelled',
+    'queued_for_agent': 'Queued for agent',
 }
 
 TERMINAL_STATES = {
@@ -48,14 +49,16 @@ ALLOWED_TRANSITIONS = {
                                    'ready_for_review', 'cancelled'},
     'analyzing_form': {'needs_user_input', 'needs_login', 'blocked_captcha',
                        'ready_for_review', 'manual_required', 'unsupported_site',
-                       'could_not_fill', 'cancelled'},
-    'needs_user_input': {'analyzing_form', 'ready_for_review', 'cancelled'},
-    'needs_login': {'analyzing_form', 'manual_required', 'cancelled'},
-    'blocked_captcha': {'analyzing_form', 'manual_required', 'cancelled'},
+                       'could_not_fill', 'queued_for_agent', 'cancelled'},
+    'needs_user_input': {'analyzing_form', 'ready_for_review', 'queued_for_agent',
+                         'cancelled'},
+    'needs_login': {'analyzing_form', 'manual_required', 'queued_for_agent', 'cancelled'},
+    'blocked_captcha': {'analyzing_form', 'manual_required', 'queued_for_agent',
+                        'cancelled'},
     'ready_for_review': {'preparing_documents', 'awaiting_final_confirmation',
-                         'analyzing_form', 'cancelled'},
+                         'analyzing_form', 'queued_for_agent', 'cancelled'},
     'awaiting_final_confirmation': {'submitting', 'ready_for_review', 'cancelled'},
-    'submitting': {'submitted', 'submission_failed'},
+    'submitting': {'submitted', 'submission_failed', 'cancelled'},
     'could_not_fill': {'analyzing_form', 'manual_required', 'cancelled'},
     'submission_failed': {'ready_for_review', 'cancelled'},
     'manual_required': set(),
@@ -63,10 +66,14 @@ ALLOWED_TRANSITIONS = {
     'url_invalid': set(),
     'submitted': set(),
     'cancelled': set(),
+    'queued_for_agent': {'analyzing_form', 'cancelled'},
 }
 
 PROFILE_FIELDS = {
     'full_name': 160,
+    'first_name': 80,
+    'middle_name': 80,
+    'last_name': 80,
     'email': 254,
     'phone': 80,
     'address': 300,
@@ -83,6 +90,42 @@ PROFILE_FIELDS = {
     'salary_preference': 160,
     'additional_facts': 4000,
 }
+
+# Account-level sections stored beside the flat fields in profile_json. They
+# are never sent to an AI provider or the worker (see shareable_profile) and
+# their values are masked in logs and summaries (see redact_profile).
+SCREENING_YES_NO = (
+    'current_employee', 'former_employee', 'age_18_plus',
+    'restrictive_agreements', 'us_person', 'conflict_of_interest',
+)
+SCREENING_TEXT = {'shift_availability': 300, 'notes': 500}
+EEO_CHOICES = {
+    'gender': ('male', 'female', 'non_binary', 'decline'),
+    'race_ethnicity': ('hispanic_or_latino', 'white', 'black_or_african_american', 'asian',
+                       'native_hawaiian_or_pacific_islander',
+                       'american_indian_or_alaska_native', 'two_or_more', 'decline'),
+    'veteran': ('not_a_veteran', 'protected_veteran', 'veteran_not_protected', 'decline'),
+    'disability': ('no', 'yes', 'decline'),
+}
+# What the profile card shows for each stored value. The apply packet sends
+# these words so the desktop agent never has to guess a form's wording.
+EEO_LABELS = {
+    'gender': {'male': 'Male', 'female': 'Female', 'non_binary': 'Non-binary',
+               'decline': 'I choose not to answer'},
+    'race_ethnicity': {
+        'hispanic_or_latino': 'Hispanic or Latino', 'white': 'White',
+        'black_or_african_american': 'Black or African American', 'asian': 'Asian',
+        'native_hawaiian_or_pacific_islander': 'Native Hawaiian or Other Pacific Islander',
+        'american_indian_or_alaska_native': 'American Indian or Alaska Native',
+        'two_or_more': 'Two or more races', 'decline': 'I choose not to answer'},
+    'veteran': {'not_a_veteran': 'I am not a veteran', 'protected_veteran': 'Protected veteran',
+                'veteran_not_protected': 'Veteran, not a protected veteran',
+                'decline': 'I choose not to answer'},
+    'disability': {'no': 'No', 'yes': 'Yes', 'decline': 'I choose not to answer'},
+}
+PROFILE_SECTIONS = ('screening', 'eeo')
+MAX_PROFILE_BYTES = 64 * 1024
+REDACTED = '[stored]'
 
 ATS_HOSTS = (
     ('greenhouse', ('greenhouse.io', 'boards.greenhouse.io')),
@@ -165,6 +208,8 @@ def _record_dict(row):
     value['job'] = _json(value.pop('job_json'), {})
     value['answers'] = _json(value.pop('answers_json'), {})
     value['automation_used'] = bool(value.get('automation_used'))
+    value['agent_owned'] = bool(value.get('agent_owned'))
+    value['review'] = _json(value.pop('review_json', None), None)
     value['state_label'] = ATTEMPT_STATES.get(value['state'], value['state'])
     value['application_url_kind'] = application_url_kind(
         value.get('source_url'), value.get('resolved_url'))
@@ -214,7 +259,14 @@ def list_attempts(db, user_id, limit=100):
     return [_record_dict(row) for row in rows]
 
 
-def create_attempt(db, user_id, job_key):
+def create_attempt(db, user_id, job_key, agent=None):
+    """Insert (or return the open) attempt for a job.
+
+    `agent` is {'role_key': ...} when the desktop agent owns the attempt. The
+    row is then inserted directly as queued_for_agent with agent_owned set, in
+    the same INSERT and commit, so it is never `queued` and the form-prep
+    worker can never pick it up.
+    """
     job_key = str(job_key or '').strip()
     if not job_key:
         raise ValueError('Choose a job to apply for')
@@ -230,20 +282,23 @@ def create_attempt(db, user_id, job_key):
     if not job:
         raise LookupError('That job is not available in your results or tracker')
     source_url = job.get('apply_url') or job.get('url') or ''
-    state = 'queued' if valid_public_url(source_url) else 'url_invalid'
+    valid = valid_public_url(source_url)
+    state = ('queued_for_agent' if agent else 'queued') if valid else 'url_invalid'
     message = (ATTEMPT_STATES[state] if source_url else
                'This result does not contain an application URL')
+    agent_owned = 1 if (agent and state == 'queued_for_agent') else 0
+    role_key = agent.get('role_key') if agent_owned else None
     attempt_id = str(uuid.uuid4())
     now = utcnow()
     db.execute(
         'INSERT INTO application_attempts '
         '(id,user_id,job_key,job_json,source_url,resolved_url,ats_kind,state,'
         'status_message,error_code,automation_used,answers_json,created_at,updated_at,'
-        'completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'completed_at,agent_owned,role_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         (attempt_id, user_id, job_key, json.dumps(job, ensure_ascii=False),
          source_url, source_url, detect_ats(source_url), state, message,
          'missing_or_invalid_url' if state == 'url_invalid' else None, 0, '{}',
-         now, now, now if state == 'url_invalid' else None),
+         now, now, now if state == 'url_invalid' else None, agent_owned, role_key),
     )
     _event(db, attempt_id, state, message, {'automation_used': False})
     existing_tracker = db.execute(
@@ -269,23 +324,42 @@ def create_attempt(db, user_id, job_key):
     return get_attempt(db, user_id, attempt_id), True
 
 
+# Columns the agent path may set in the same UPDATE as a state change.
+EXTRA_UPDATE_COLUMNS = {
+    'claim_id', 'claimed_at', 'lease_expires_at', 'posting_status', 'posting_checked_at',
+    'review_json', 'user_approved_at', 'approval_note', 'role_key',
+}
+
+
 def transition(db, user_id, attempt_id, state, message=None, error_code=None,
-               metadata=None, automation_used=None, force=False):
+               metadata=None, automation_used=None, force=False, *,
+               allow_agent=False, extra_updates=None):
     if state not in ATTEMPT_STATES:
         raise ValueError('Invalid application state')
     current = get_attempt(db, user_id, attempt_id, include_details=False)
     if not current:
         raise LookupError('Application attempt not found')
+    # An attempt the desktop agent owns is only moved by the agent path, apart
+    # from the user cancelling it. This is a backstop; the worker routes also
+    # refuse before they get this far.
+    if current['agent_owned'] and not allow_agent and state != 'cancelled':
+        raise ValueError('This attempt is handled by the desktop agent')
+    extra_updates = dict(extra_updates or {})
+    unknown = set(extra_updates) - EXTRA_UPDATE_COLUMNS
+    if unknown:
+        raise ValueError('Unsupported attempt update: ' + ', '.join(sorted(unknown)))
     if not force and state != current['state'] and state not in ALLOWED_TRANSITIONS[current['state']]:
         raise ValueError(f"Cannot move from {current['state']} to {state}")
     now = utcnow()
     final_message = str(message or ATTEMPT_STATES[state])[:1000]
     used = current['automation_used'] if automation_used is None else bool(automation_used)
+    extra_sql = ''.join(f',{column}=?' for column in extra_updates)
     db.execute(
         'UPDATE application_attempts SET state=?,status_message=?,error_code=?,'
-        'automation_used=?,updated_at=?,completed_at=? WHERE id=? AND user_id=?',
+        f'automation_used=?,updated_at=?,completed_at=?{extra_sql} WHERE id=? AND user_id=?',
         (state, final_message, error_code, int(used), now,
-         now if state in TERMINAL_STATES else None, str(attempt_id), user_id),
+         now if state in TERMINAL_STATES else None, *extra_updates.values(),
+         str(attempt_id), user_id),
     )
     _event(db, str(attempt_id), state, final_message, metadata)
     db.commit()
@@ -298,6 +372,9 @@ def retry_attempt(db, user_id, attempt_id):
         raise LookupError('Application attempt not found')
     if previous['state'] == 'submitted':
         raise ValueError('A submitted application cannot be retried')
+    if previous['agent_owned']:
+        raise ValueError('This application is handled by the desktop agent. '
+                         'Use Apply for me to queue it again')
     if previous['state'] not in TERMINAL_STATES | {'could_not_fill'}:
         return get_attempt(db, user_id, attempt_id), False
     return create_attempt(db, user_id, previous['job_key'])
@@ -338,23 +415,136 @@ def load_profile(db, user_id):
             'updated_at': row['updated_at'] if row else None}
 
 
+def _clean_screening(value):
+    if not isinstance(value, dict):
+        raise ValueError('Screening answers must be an object')
+    cleaned = {}
+    for key in SCREENING_YES_NO:
+        answer = str(value.get(key) or '').strip().lower()
+        if answer not in ('', 'yes', 'no'):
+            raise ValueError(f'Screening answer "{key}" must be yes, no or left to ask')
+        cleaned[key] = answer
+    for key, limit in SCREENING_TEXT.items():
+        cleaned[key] = str(value.get(key) or '').strip()[:limit]
+    return cleaned
+
+
+def _clean_eeo(value):
+    if not isinstance(value, dict):
+        raise ValueError('Self-identification must be an object')
+    # Opt-in is explicit. Without it nothing is kept, so unticking the box and
+    # saving discards every stored value.
+    if value.get('opt_in') is not True:
+        return {'opt_in': False}
+    cleaned = {'opt_in': True}
+    for key, choices in EEO_CHOICES.items():
+        answer = str(value.get(key) or '').strip()
+        if answer not in ('',) + choices:
+            raise ValueError(f'Unrecognized self-identification choice for "{key}"')
+        cleaned[key] = answer
+    return cleaned
+
+
 def save_profile(db, user_id, profile):
+    """Save the account-level profile.
+
+    Flat fields behave as before (a missing field is dropped). The screening and
+    eeo sections are preserved when the request omits them, so an old browser
+    tab cannot wipe them; a present section is validated and replaces the old.
+    """
     if not isinstance(profile, dict):
         raise ValueError('Application profile must be an object')
+    existing = load_profile(db, user_id)['profile']
     cleaned = {}
     for field, limit in PROFILE_FIELDS.items():
         value = profile.get(field)
         if value is not None:
             cleaned[field] = str(value).strip()[:limit]
+    # first / middle / last are the source of truth. full_name stays as the
+    # composed value so everything that reads it (the document writer, the form
+    # worker, older tabs) keeps working.
+    if cleaned.get('first_name') or cleaned.get('last_name'):
+        cleaned['full_name'] = ' '.join(
+            part for part in (cleaned.get('first_name'), cleaned.get('middle_name'),
+                              cleaned.get('last_name')) if part)[:PROFILE_FIELDS['full_name']]
+    cleaners = {'screening': _clean_screening, 'eeo': _clean_eeo}
+    for section in PROFILE_SECTIONS:
+        if section in profile:
+            cleaned[section] = cleaners[section](profile[section])
+        elif section in existing:
+            cleaned[section] = existing[section]
+    encoded = json.dumps(cleaned, ensure_ascii=False)
+    if len(encoded.encode('utf-8')) > MAX_PROFILE_BYTES:
+        raise ValueError('Application profile is too large to save')
     now = utcnow()
     db.execute(
         'INSERT INTO application_profiles (user_id,profile_json,updated_at) '
         'VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET '
         'profile_json=excluded.profile_json,updated_at=excluded.updated_at',
-        (user_id, json.dumps(cleaned, ensure_ascii=False), now),
+        (user_id, encoded, now),
     )
     db.commit()
     return {'profile': cleaned, 'updated_at': now}
+
+
+def shareable_profile(profile):
+    """The contact and preference facts that may leave the app (AI providers,
+    the form-filling worker). Screening, self-identification and anything else
+    stored in the profile never do."""
+    return {field: profile[field] for field in PROFILE_FIELDS if field in (profile or {})}
+
+
+NAME_SUFFIXES = {'jr', 'sr', 'ii', 'iii', 'iv'}
+NAME_PARTICLES = {'de', 'del', 'della', 'di', 'da', 'van', 'von', 'der', 'la', 'le', 'st'}
+
+
+def name_parts(profile):
+    """First, middle, last and suffix for form fields.
+
+    Stored first/last names are used as they are. A profile that only has the
+    older full name is split here, and `ambiguous` says the split was a guess
+    (one word, a comma, more than three words, a particle like "de" or "van"),
+    so the agent confirms it with the user instead of typing it.
+    """
+    profile = profile or {}
+    first, middle, last = (str(profile.get(key) or '').strip()
+                           for key in ('first_name', 'middle_name', 'last_name'))
+    if first or last:
+        return {'first': first, 'middle': middle, 'last': last, 'suffix': '',
+                'ambiguous': not (first and last), 'source': 'stored'}
+    full = str(profile.get('full_name') or '').strip()
+    ambiguous = ',' in full
+    tokens = full.replace(',', ' ').split()
+    suffix = ''
+    if tokens and tokens[-1].rstrip('.').casefold() in NAME_SUFFIXES:
+        suffix = tokens.pop()
+    if any(token.casefold() in NAME_PARTICLES for token in tokens[1:]):
+        ambiguous = True
+    parts = {'first': '', 'middle': middle, 'last': '', 'suffix': suffix}
+    if len(tokens) == 1:
+        parts['first'], ambiguous = tokens[0], True
+    elif len(tokens) == 2:
+        parts['first'], parts['last'] = tokens
+    elif len(tokens) == 3:
+        parts['first'], parts['middle'], parts['last'] = tokens
+    elif len(tokens) > 3:
+        parts['first'], parts['last'] = tokens[0], tokens[-1]
+        parts['middle'], ambiguous = ' '.join(tokens[1:-1]), True
+    else:
+        ambiguous = True
+    return dict(parts, ambiguous=ambiguous, source='derived')
+
+
+def redact_profile(profile):
+    """A copy safe for logs, events and summaries: screening and EEO values are
+    replaced by a marker, so only that they exist is visible."""
+    safe = dict(profile or {})
+    for section in PROFILE_SECTIONS:
+        value = safe.get(section)
+        if isinstance(value, dict):
+            safe[section] = {key: (REDACTED if item not in ('', False, None) and key != 'opt_in' else item)
+                             for key, item in value.items()}
+    return safe
 
 
 def next_artifact_version(db, attempt_id, kind):
@@ -395,6 +585,11 @@ def approve_artifact(db, user_id, artifact_id, decision):
     ).fetchone()
     if not row:
         raise LookupError('Document not found')
+    owner = db.execute(
+        'SELECT agent_owned FROM application_attempts WHERE id=? AND user_id=?',
+        (row['attempt_id'], user_id)).fetchone()
+    if owner and owner['agent_owned']:
+        raise ValueError('This attempt is handled by the desktop agent')
     now = utcnow()
     # DOCX and PDF are two renderings of the same approved content version.
     # One decision applies to the pair so the user is not asked to approve the
@@ -467,6 +662,8 @@ def create_confirmation_token(db, user_id, attempt_id, lifetime_minutes=10):
     attempt = get_attempt(db, user_id, attempt_id, include_details=False)
     if not attempt:
         raise LookupError('Application attempt not found')
+    if attempt['agent_owned']:
+        raise ValueError('This attempt is handled by the desktop agent')
     if attempt['state'] != 'ready_for_review':
         raise ValueError('The application must be ready for review first')
     raw = secrets.token_urlsafe(32)

@@ -65,6 +65,12 @@ def main():
     # config.py reads these to select DB + URL prefix — set BEFORE launching gunicorn.
     os.environ['JOBSEARCH_ENV'] = cfg['app_env']
     os.environ['URL_PREFIX'] = cfg['url_prefix']
+    # The desktop-agent API (apply queue) is on for both environments, so a
+    # reboot, a deploy or a managed restart never turns it off. Every call still
+    # needs a valid desktop session key. Start with JOBSEARCH_AGENT_API_ENABLED=false
+    # in the caller's environment to switch it off. The form-prep and submit
+    # worker flags are separate and stay off.
+    os.environ.setdefault('JOBSEARCH_AGENT_API_ENABLED', 'true')
 
     try:
         proc = subprocess.Popen([

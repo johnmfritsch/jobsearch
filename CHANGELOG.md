@@ -7,6 +7,58 @@
 
 ---
 
+## [v0.2.13 — October 5, 2026]
+### Added
+- **Search progress follows you.** A spinning "Search in progress…" indicator appears in the top-right while a search runs, and a search keeps running when you leave the Run page. Reloading the portal or returning to Run a new search picks the live status back up (and the Cancel button) instead of showing a blank page.
+### Fixed
+- **Results no longer show 0 while a new search is running.** The results page now keeps showing your last finished search until the new one completes, instead of an empty list.
+### Changed
+
+---
+
+## [v0.2.12 — October 3, 2026]
+### Added
+### Fixed
+### Changed
+- **Name is First, Middle and Last.** The application profile now asks for first, middle and last name instead of a full name plus a middle name, so forms with separate name fields are filled exactly as you entered them. A profile saved with only a full name shows it split into the three boxes for you to check and save, and the apply agent confirms with you before typing a name it had to guess (one word, a comma, a particle like "de" or "van", or more than three words).
+
+---
+
+## [v0.2.11 — October 3, 2026]
+### Added
+### Fixed
+### Changed
+- **Desktop key card names the right file.** The Desktop session key card now tells you to save the key as the file for the environment you are on (a DEV key and a PROD key each get their own file), so creating a PROD key no longer collides with the DEV one.
+- **The desktop agent API now stays on.** It is started on automatically in both environments, so a NAS reboot, a deploy or a restart no longer turns it off and nobody has to export a setting by hand. Every call still needs a desktop session key.
+
+---
+
+## [v0.2.10 — October 2, 2026]
+### Added
+- **Apply for me and the desktop agent queue.** A saved job has an **Apply for me** button that queues it for the Claude session on your own PC, under the role you choose (it asks when the job has none). A role must have confirmed work history and saved resume text, and LinkedIn stays manual. The Application assistant gains a **Desktop session key** card (a revocable key that lasts 90 days, shown once, not an AI provider key) and a **Saved answers** card where you correct, delete or tick "Reuse this answer" for questions you answered to the agent. The agent API is off until the server is started with it turned on; through it the session claims one job at a time, receives your role's history, your answers and, if you opted in, your self-identification answers (listed back to you before anything is submitted), and reports its progress. The server never opens a browser or submits anything: a job is only recorded as applied after you said yes for that application, and then only that one tracker row changes. The self-identification text now says these answers are shared with your Claude desktop session when you queue a job.
+- **Open apply session link.** Each saved job has an **Open apply session** link that starts the Claude apply session on the PC where the Project Portal bridge is installed. The link carries no job and no key; the session works your apply queue. On a PC without the bridge it does nothing.
+### Fixed
+### Changed
+
+---
+
+## [v0.2.9 — October 2, 2026]
+### Added
+- **Application answers for the apply assistant.** The application profile now holds a middle name, standard screening answers (current or former employee, 18 or older, restrictive agreements, U.S. person, conflict of interest, shift availability; "18 or older" and "U.S. person" start preselected as Yes until you save your own answers) and optional voluntary self-identification answers that are stored only if you opt in and are never sent to an AI provider. A new Work history and education card keeps a separate list for each role: import it from the role's resume as editable drafts, copy it from another role through a preview you can change before saving (merge or replace), undo the last save, and get a warning when the same employer has different dates under two roles. Creating a new role can start clean or start from an existing role's history.
+### Fixed
+### Changed
+- **Admin Backlog page.** The admin-only Backlog page now uses the same layout as GardenBuddy's: items grouped by priority with an explanation of P1-P5 and the size letters, the type, plan and "awaiting testing" badges beside each title, what blocks what, and a "Show full item" section that opens each item's whole plan.
+
+---
+
+## [v0.2.8 — October 2, 2026]
+### Added
+- **Backlog page for administrators.** Accounts marked as admin get a Backlog card on the dashboard that opens a read-only page listing every planned item with its summary, plan stage, status, dependencies, and the full item text. Other users never see the card and the page is refused for them.
+### Fixed
+### Changed
+
+---
+
 ## [v0.2.7 — September 27, 2026]
 ### Added
 - **Rejected** is now a distinct stage for saved and manually added jobs, with its own badge and stage filter. Existing Closed jobs keep their stage.

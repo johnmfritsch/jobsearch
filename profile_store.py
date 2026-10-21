@@ -520,20 +520,37 @@ def save_triage(directory, triage):
     finally: db.close()
 
 
+def load_record_on(db, user_id, job_key):
+    """load_record on a connection the caller already holds (the request's)."""
+    item = db.execute(
+        "SELECT record_json FROM application_records WHERE user_id=? AND job_key=?",
+        (user_id, str(job_key))).fetchone()
+    if not item:
+        return None
+    try:
+        return json.loads(item["record_json"])
+    except (TypeError, ValueError):
+        return None
+
+
+def upsert_record_on(db, user_id, job_key, record):
+    """upsert_record on a connection the caller already holds."""
+    db.execute(
+        "INSERT INTO application_records (user_id,job_key,record_json,updated_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(user_id,job_key) DO UPDATE SET "
+        "record_json=excluded.record_json,updated_at=excluded.updated_at",
+        (user_id, str(job_key), json.dumps(record, ensure_ascii=False),
+         datetime.utcnow().isoformat()))
+    db.commit()
+    return record
+
+
 def load_record(directory, job_key):
     """Return one tracker record, or None. Used where rewriting every row would
     be wrong -- see upsert_record."""
     db, row = _profile(directory)
     try:
-        item = db.execute(
-            "SELECT record_json FROM application_records WHERE user_id=? AND job_key=?",
-            (row["id"], str(job_key))).fetchone()
-        if not item:
-            return None
-        try:
-            return json.loads(item["record_json"])
-        except (TypeError, ValueError):
-            return None
+        return load_record_on(db, row["id"], job_key)
     finally:
         db.close()
 
@@ -549,14 +566,7 @@ def upsert_record(directory, job_key, record):
     """
     db, row = _profile(directory)
     try:
-        db.execute(
-            "INSERT INTO application_records (user_id,job_key,record_json,updated_at) "
-            "VALUES (?,?,?,?) ON CONFLICT(user_id,job_key) DO UPDATE SET "
-            "record_json=excluded.record_json,updated_at=excluded.updated_at",
-            (row["id"], str(job_key), json.dumps(record, ensure_ascii=False),
-             datetime.utcnow().isoformat()))
-        db.commit()
-        return record
+        return upsert_record_on(db, row["id"], job_key, record)
     finally:
         db.close()
 
@@ -774,7 +784,12 @@ def decision_report_history(directory, limit=20):
 def latest_results(directory, limit=500):
     db, row = _profile(directory)
     try:
-        run = db.execute("SELECT id,test_mode,state,status_json,started_at,completed_at FROM search_runs WHERE user_id=? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+        # A run still in progress has no results yet; keep showing the last
+        # finished run until it completes rather than an empty list.
+        cols = "id,test_mode,state,status_json,started_at,completed_at"
+        run = db.execute(f"SELECT {cols} FROM search_runs WHERE user_id=? AND state!='running' ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+        if not run:
+            run = db.execute(f"SELECT {cols} FROM search_runs WHERE user_id=? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
         if not run: return None
         jobs = [dict(json.loads(r["job_json"]), job_key=_stable_job_key(r["job_key"])) for r in db.execute("SELECT job_key,job_json FROM job_results WHERE run_id=? ORDER BY score DESC LIMIT ?", (run["id"], limit))]
         status=json.loads(run["status_json"])

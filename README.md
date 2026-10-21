@@ -73,4 +73,4 @@ The database, uploaded résumés, logs, and backups are runtime data and are not
 
 LAN addresses in this repo are masked as `192.168.x.x`.
 
-_Source snapshot: JobSearch v0.2.7 (2026-09-27)._
+_Source snapshot: JobSearch v0.2.13 (2026-10-05)._

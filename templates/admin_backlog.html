@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block title %}Backlog — JobSearch{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center gap-3 mb-3">
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('portal.dashboard') }}">← Dashboard</a>
+    <h1 class="h3 mb-0">📋 Backlog</h1>
+</div>
+
+{% if error %}
+<div class="alert alert-danger" role="alert">
+    <strong>Couldn't load the backlog.</strong>
+    <div class="small mt-1" style="font-family:monospace; word-break:break-word;">{{ error }}</div>
+</div>
+{% else %}
+{# Markup comes from the shared backlog-kit (/volume1/util/backlog_kit); all item text is HTML-escaped there. #}
+{{ backlog_html|safe }}
+{% endif %}
+{% endblock %}

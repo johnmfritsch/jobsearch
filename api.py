@@ -34,11 +34,16 @@ from io import BytesIO
 from flask import Blueprint, current_app, jsonify, request, send_file
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
+import agent_packet
+import agent_queue
 import auto_apply
+import desktop_keys
 import document_generator
 import manual_jobs
 import profile_store
+import question_bank
 import role_documents
+import role_history
 from auth import current_user
 from database import request_db
 
@@ -467,6 +472,8 @@ def delete_search_preset():
         return _fail('Choose a search preset', 400)
     if not profile_store.delete_search_preset(key, preset_id):
         return _fail('Search preset not found', 404)
+    # A role's work history and education go with the role.
+    role_history.delete_for_role(request_db(), current_user()['id'], f'preset:{preset_id}')
     return jsonify({'success': True})
 
 
@@ -677,6 +684,10 @@ def _provider_summaries(profile_key):
 def _resume_for_attempt(db, user, attempt):
     """Resolve the resume from the role recorded on the server-side job snapshot."""
     role_name = str(attempt.get('job', {}).get('search_role') or 'Default').strip() or 'Default'
+    return _resume_for_role_name(db, user, role_name)
+
+
+def _resume_for_role_name(db, user, role_name):
     role = role_documents.resolve_role(db, user['id'], role_name=role_name)
     row = db.execute(
         'SELECT content_text AS resume_text FROM role_documents WHERE user_id=? '
@@ -791,6 +802,112 @@ def save_application_profile():
     return jsonify({'success': True, **result})
 
 
+# ── role-level work history and education (backlog 19.1) ─────────────────────
+
+def _history_role(db, user, values, prefix=''):
+    """Resolve the target (or, with prefix 'source_', the source) role."""
+    role = role_documents.resolve_role(
+        db, user['id'], values.get(prefix + 'preset_id'), values.get(prefix + 'role_name'))
+    if role['role_key'].startswith('name:'):
+        # resolve_role keys unknown names by hash (for jobs found under a since
+        # deleted role). History is only kept for roles that exist.
+        raise LookupError('Role not found')
+    return role
+
+
+def _history_response(db, user, role, history):
+    history['role'] = {'role_key': role['role_key'], 'role_name': role['role_name'],
+                       'preset_id': role['preset_id']}
+    history.setdefault('warnings', role_history.cross_role_warnings(db, user['id'], role['role_key']))
+    return jsonify({'success': True, 'history': history})
+
+
+@api_bp.route('/role_history')
+def get_role_history():
+    user, err = _application_user()
+    if err:
+        return err
+    db = request_db()
+    try:
+        role = _history_role(db, user, request.args)
+    except ValueError as exc:
+        return _fail(str(exc), 400)
+    except LookupError as exc:
+        return _fail(str(exc), 404)
+    return _history_response(db, user, role, role_history.get_history(db, user['id'], role['role_key']))
+
+
+@api_bp.route('/role_history', methods=['POST'])
+def save_role_history():
+    user, err = _application_user()
+    if err:
+        return err
+    db = request_db()
+    data = _body()
+    try:
+        role = _history_role(db, user, data)
+        source = 'resume_draft' if data.get('source') == 'resume_draft' else 'manual'
+        history = role_history.save_history(db, user['id'], role, data.get('history'), source)
+    except ValueError as exc:
+        return _fail(str(exc), 400)
+    except LookupError as exc:
+        return _fail(str(exc), 404)
+    return _history_response(db, user, role, history)
+
+
+@api_bp.route('/role_history/import_resume', methods=['POST'])
+def import_role_history_from_resume():
+    user, err = _application_user()
+    if err:
+        return err
+    db = request_db()
+    try:
+        role = _history_role(db, user, _body())
+    except ValueError as exc:
+        return _fail(str(exc), 400)
+    except LookupError as exc:
+        return _fail(str(exc), 404)
+    resume, _name = _resume_for_role_name(db, user, role['role_name'])
+    if not str(resume or '').strip():
+        return _fail('This role has no saved resume to read', 400)
+    return jsonify({'success': True, 'draft': role_history.draft_from_resume(resume),
+                    'role_name': role['role_name']})
+
+
+@api_bp.route('/role_history/copy_preview', methods=['POST'])
+def preview_role_history_copy():
+    user, err = _application_user()
+    if err:
+        return err
+    db = request_db()
+    data = _body()
+    try:
+        target = _history_role(db, user, data)
+        source = _history_role(db, user, data, 'source_')
+        preview = role_history.copy_preview(db, user['id'], source, target, data.get('mode'))
+    except ValueError as exc:
+        return _fail(str(exc), 400)
+    except LookupError as exc:
+        return _fail(str(exc), 404)
+    return jsonify({'success': True, 'preview': preview})
+
+
+@api_bp.route('/role_history/undo', methods=['POST'])
+def undo_role_history():
+    user, err = _application_user()
+    if err:
+        return err
+    db = request_db()
+    try:
+        role = _history_role(db, user, _body())
+        history = role_history.undo_history(db, user['id'], role)
+    except ValueError as exc:
+        return _fail(str(exc), 400)
+    except LookupError as exc:
+        return _fail(str(exc), 404)
+    return _history_response(db, user, role, history)
+
+
 @api_bp.route('/application_attempts')
 def application_attempts():
     user, err = _application_user()
@@ -890,7 +1007,8 @@ def estimate_application_documents(attempt_id):
     provider = str(request.args.get('provider') or 'openai').strip().lower()
     generate_resume = request.args.get('resume', '1') not in {'0', 'false'}
     generate_cover = request.args.get('cover_letter', '1') not in {'0', 'false'}
-    profile = auto_apply.load_profile(request_db(), user['id'])['profile']
+    profile = auto_apply.shareable_profile(
+        auto_apply.load_profile(request_db(), user['id'])['profile'])
     resume, role_name = _resume_for_attempt(request_db(), user, attempt)
     try:
         estimate = document_generator.estimate_cost(
@@ -960,7 +1078,7 @@ def generate_application_documents(attempt_id):
     current = auto_apply.get_attempt(db, user['id'], attempt_id, False)
     if not current:
         return _fail('Application attempt not found', 404)
-    profile = auto_apply.load_profile(db, user['id'])['profile']
+    profile = auto_apply.shareable_profile(auto_apply.load_profile(db, user['id'])['profile'])
     resume, _role_name = _resume_for_attempt(db, user, current)
     try:
         attempt = document_generator.generate_documents(
@@ -1066,6 +1184,10 @@ def prepare_application(attempt_id):
     attempt = auto_apply.get_attempt(db, user['id'], attempt_id)
     if not attempt:
         return _fail('Application attempt not found', 404)
+    if attempt['agent_owned']:
+        # The desktop agent owns this row. Refuse before the try below, which
+        # would otherwise answer a refusal by transitioning to could_not_fill.
+        return _fail('This attempt is handled by the desktop agent', 409)
     if attempt['ats_kind'] == 'linkedin':
         attempt = auto_apply.transition(
             db, user['id'], attempt_id, 'manual_required',
@@ -1088,7 +1210,8 @@ def prepare_application(attempt_id):
             if artifact:
                 artifact_paths[kind] = '/artifacts/' + artifact['relative_path'].lstrip('/')
         result = _worker_request('prepare', user['id'], attempt, {
-            'profile': auto_apply.load_profile(db, user['id'])['profile'],
+            'profile': auto_apply.shareable_profile(
+                auto_apply.load_profile(db, user['id'])['profile']),
             'artifact_paths': artifact_paths,
         })
         state = result.get('state')
@@ -1144,6 +1267,9 @@ def submit_application(attempt_id):
         return _fail('Application submission is disabled until DEV acceptance', 409)
     db = request_db()
     data = _body()
+    owned = auto_apply.get_attempt(db, user['id'], attempt_id, include_details=False)
+    if owned and owned['agent_owned']:
+        return _fail('This attempt is handled by the desktop agent', 409)
     if not auto_apply.consume_confirmation_token(
             db, user['id'], attempt_id, data.get('confirmation_token')):
         return _fail('Final confirmation is missing, expired, or already used', 409)
@@ -1224,6 +1350,264 @@ def application_worker_callback():
     except LookupError as exc:
         return _fail(str(exc), 404)
     return jsonify({'success': True, 'attempt_id': attempt['id'], 'state': attempt['state']})
+
+
+# ── apply queue for the desktop agent (backlog 19.2) ─────────────────────────
+
+AGENT_BODY_LIMIT = 64 * 1024
+
+
+def _coded(exc):
+    body = {'error': str(exc)}
+    if getattr(exc, 'code', None):
+        body['code'] = exc.code
+    return jsonify(body), getattr(exc, 'status', 409)
+
+
+@api_bp.route('/agent_queue', methods=['POST'])
+def queue_application_for_agent():
+    user, err = _application_user()
+    if err:
+        return err
+    data = _body()
+    try:
+        attempt, created = agent_queue.queue_for_agent(
+            request_db(), user['id'], data.get('job_key'), data.get('role_key'))
+    except agent_queue.AgentError as exc:
+        return _coded(exc)
+    except LookupError as exc:
+        return jsonify({'error': str(exc), 'code': 'not_found'}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc), 'code': 'conflict'}), 409
+    return jsonify({'success': True, 'created': created, 'attempt': attempt}), (201 if created else 200)
+
+
+@api_bp.route('/agent_queue')
+def list_agent_queue():
+    user, err = _application_user()
+    if err:
+        return err
+    items, waiting = agent_queue.list_agent_attempts(request_db(), user['id'])
+    return jsonify({'success': True, 'attempts': items, 'waiting': waiting})
+
+
+@api_bp.route('/desktop_session_keys')
+def list_desktop_session_keys():
+    user, err = _application_user()
+    if err:
+        return err
+    return jsonify({'success': True, 'keys': desktop_keys.list_keys(request_db(), user['id']),
+                    'agent_api_enabled': bool(current_app.config.get('AGENT_API_ENABLED'))})
+
+
+@api_bp.route('/desktop_session_keys', methods=['POST'])
+def create_desktop_session_key():
+    user, err = _application_user()
+    if err:
+        return err
+    try:
+        created = desktop_keys.create_key(request_db(), user['id'], _body().get('label'))
+    except desktop_keys.KeyRuleError as exc:
+        return _fail(str(exc), exc.status)
+    response = jsonify({'success': True, **created})
+    response.headers['Cache-Control'] = 'no-store'
+    return response, 201
+
+
+@api_bp.route('/desktop_session_keys/<key_id>', methods=['DELETE'])
+def revoke_desktop_session_key(key_id):
+    user, err = _application_user()
+    if err:
+        return err
+    if not desktop_keys.revoke_key(request_db(), user['id'], key_id):
+        return _fail('Desktop key not found', 404)
+    return jsonify({'success': True})
+
+
+@api_bp.route('/question_bank')
+def get_question_bank():
+    user, err = _application_user()
+    if err:
+        return err
+    return jsonify({'success': True, 'answers': question_bank.list_rows(request_db(), user['id'])})
+
+
+@api_bp.route('/question_bank/<row_id>', methods=['POST'])
+def update_question_bank_row(row_id):
+    user, err = _application_user()
+    if err:
+        return err
+    data = _body()
+    try:
+        row = question_bank.user_update(
+            request_db(), user['id'], row_id, data.get('answer'), data.get('safe_to_autofill'))
+    except question_bank.BankError as exc:
+        return _fail(str(exc), exc.status)
+    except LookupError as exc:
+        return _fail(str(exc), 404)
+    return jsonify({'success': True, 'answer': row})
+
+
+@api_bp.route('/question_bank/<row_id>', methods=['DELETE'])
+def delete_question_bank_row(row_id):
+    user, err = _application_user()
+    if err:
+        return err
+    try:
+        question_bank.delete(request_db(), user['id'], row_id)
+    except LookupError as exc:
+        return _fail(str(exc), 404)
+    return jsonify({'success': True})
+
+
+def _agent_view(attempt):
+    return {'id': attempt['id'], 'state': attempt['state'], 'state_label': attempt['state_label'],
+            'status_message': attempt.get('status_message'),
+            'lease_expires_at': attempt.get('lease_expires_at')}
+
+
+def _run_agent(attempt_id, work):
+    """Authenticate the desktop key, find the held attempt, run `work`.
+
+    The Bearer key is the only credential: no session cookie, no user id from
+    the body. A GET carries claim_id in the query; a POST in the JSON body.
+    """
+    db = request_db()
+    user, err = desktop_keys.agent_user(db)
+    if err:
+        return err
+    if (request.content_length or 0) > AGENT_BODY_LIMIT:
+        return _fail('Request body is too large', 413)
+    body = _body() if request.method == 'POST' else {}
+    claim_id = request.args.get('claim_id') if request.method == 'GET' else body.get('claim_id')
+    attempt_id = attempt_id or body.get('attempt_id')
+    try:
+        attempt = agent_queue.held(db, user['id'], attempt_id, claim_id)
+        result = work(db, user, attempt, body)
+        desktop_keys.touch(db, user)
+        return result
+    except agent_queue.AgentError as exc:
+        return _coded(exc)
+    except question_bank.BankError as exc:
+        return _fail(str(exc), exc.status)
+    except LookupError as exc:
+        return _fail(str(exc), 404)
+    except ValueError as exc:
+        return _fail(str(exc), 409)
+
+
+def _role_name_for(db, user, attempt):
+    return role_documents.role_key_name(db, user['id'], attempt.get('role_key'))
+
+
+@api_bp.route('/agent/queue')
+def agent_queue_list():
+    db = request_db()
+    user, err = desktop_keys.agent_user(db)
+    if err:
+        return err
+    items, waiting = agent_queue.list_agent_attempts(db, user['id'])
+    desktop_keys.touch(db, user)
+    return jsonify({'success': True, 'attempts': items, 'waiting': waiting})
+
+
+@api_bp.route('/agent/queue/next', methods=['POST'])
+def agent_queue_next():
+    db = request_db()
+    user, err = desktop_keys.agent_user(db)
+    if err:
+        return err
+    # The claim is the first write on this connection (see agent_queue.claim_next).
+    attempt = agent_queue.claim_next(db, user['id'])
+    desktop_keys.touch(db, user)
+    if not attempt:
+        return '', 204
+    return jsonify({'success': True, 'packet': agent_packet.build(db, user['id'], attempt)})
+
+
+@api_bp.route('/agent/attempts/<attempt_id>/posting', methods=['POST'])
+def agent_posting(attempt_id):
+    def work(db, user, attempt, body):
+        updated = agent_queue.record_posting(db, user['id'], attempt, body,
+                                             _role_name_for(db, user, attempt))
+        return jsonify({'success': True, 'attempt': _agent_view(updated)})
+    return _run_agent(attempt_id, work)
+
+
+@api_bp.route('/agent/attempts/<attempt_id>/progress', methods=['POST'])
+def agent_progress(attempt_id):
+    def work(db, user, attempt, body):
+        updated = agent_queue.record_progress(db, user['id'], attempt, body)
+        return jsonify({'success': True, 'attempt': _agent_view(updated)})
+    return _run_agent(attempt_id, work)
+
+
+@api_bp.route('/agent/attempts/<attempt_id>/review', methods=['POST'])
+def agent_review(attempt_id):
+    def work(db, user, attempt, body):
+        updated, sha = agent_queue.record_review(db, user['id'], attempt, body)
+        return jsonify({'success': True, 'attempt': _agent_view(updated), 'review_sha': sha})
+    return _run_agent(attempt_id, work)
+
+
+@api_bp.route('/agent/attempts/<attempt_id>/approval', methods=['POST'])
+def agent_approval(attempt_id):
+    def work(db, user, attempt, body):
+        profile = auto_apply.load_profile(db, user['id'])['profile']
+        opted_in = (profile.get('eeo') or {}).get('opt_in') is True
+        updated = agent_queue.record_approval(db, user['id'], attempt, body, opted_in)
+        return jsonify({'success': True, 'attempt': _agent_view(updated)})
+    return _run_agent(attempt_id, work)
+
+
+@api_bp.route('/agent/attempts/<attempt_id>/outcome', methods=['POST'])
+def agent_outcome(attempt_id):
+    def work(db, user, attempt, body):
+        updated, extra = agent_queue.record_outcome(
+            db, user['id'], attempt, body, _role_name_for(db, user, attempt))
+        return jsonify({'success': True, 'attempt': _agent_view(updated), **extra})
+    return _run_agent(attempt_id, work)
+
+
+@api_bp.route('/agent/attempts/<attempt_id>/release', methods=['POST'])
+def agent_release(attempt_id):
+    def work(db, user, attempt, body):
+        updated = agent_queue.release(db, user['id'], attempt)
+        return jsonify({'success': True, 'attempt': _agent_view(updated)})
+    return _run_agent(attempt_id, work)
+
+
+@api_bp.route('/agent/questions', methods=['POST'])
+def agent_questions():
+    def work(db, user, attempt, body):
+        if attempt['state'] not in agent_queue.LIVE_STATES:
+            raise agent_queue.AgentError('The attempt is not being worked', 409, 'wrong_state')
+        row = question_bank.from_agent(db, user['id'], attempt, body)
+        if attempt['state'] == 'analyzing_form':
+            agent_queue.extend_lease(db, attempt['id'])
+        return jsonify({'success': True, 'question': row})
+    return _run_agent(None, work)
+
+
+@api_bp.route('/agent/attempts/<attempt_id>/resume')
+def agent_resume(attempt_id):
+    def work(db, user, attempt, body):
+        if attempt['state'] not in agent_queue.LIVE_STATES:
+            raise agent_queue.AgentError('The attempt is not being worked', 409, 'wrong_state')
+        row = role_documents.get_document(
+            db, user['id'], request.args.get('document_id'), attempt.get('role_key'))
+        if not row or row['format'] != 'pdf' or row['kind'] not in ('resume', 'cover_letter'):
+            return _fail('Role document not found', 404)
+        try:
+            path = role_documents.safe_path(
+                role_documents.library_root(current_app.config['DATABASE']), row['relative_path'])
+        except ValueError as exc:
+            return _fail(str(exc), 400)
+        if not path.is_file() or auto_apply.file_sha256(path) != row['sha256']:
+            return _fail('Role document file is missing or damaged', 409)
+        return send_file(path, mimetype=row['mime_type'], as_attachment=True,
+                         download_name=row['file_name'])
+    return _run_agent(attempt_id, work)
 
 
 # ── triage / tracker / views ─────────────────────────────────────────────────
